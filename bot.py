@@ -9,17 +9,20 @@ import string
 import re
 from flask import Flask
 from threading import Thread
+import secrets
+import asyncio
 
 # =====================
 # ⚙️ CONFIG
 # =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_PREFIX = "!"
+BOT_PREFIX = "/"
 ROLE_ID_ALLOWED = 1420109032319881266
 
 CREATE_URL = "https://keyauth.x10.mx/api/apiv1.php"
 RESET_URL_TEMPLATE = "https://keyauth.x10.mx/api/reset.php?key={key}"
 MAX_KEYS_PER_COMMAND = 50
+INTERACTIVE_TIMEOUT = 60  # giây cho mỗi câu hỏi trong flow tương tác
 
 # =====================
 # 🎞 GIF ICONS
@@ -62,35 +65,64 @@ def has_role_allowed():
 
 
 def generate_saitama_key(custom: str = None):
-    """Tạo key SAITAMA-XXXXX hoặc custom."""
+    """
+    Sinh key ngẫu nhiên dạng HEX-like (13 ký tự).
+    Nếu custom được cung cấp, tạo 1 phần hex + clean custom làm suffix.
+    """
+    hex_part = secrets.token_hex(7).upper()[:13]
     if custom:
-        return f"SAITAMA-{custom.upper()}"
-    return f"SAITAMA-{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}"
+        # sanitize custom: chữ/ số / - / _
+        safe = re.sub(r'[^A-Za-z0-9\-_]', '', custom)[:12].upper()
+        return f"{hex_part}/{safe}"
+    return hex_part
 
 
-async def call_create_key(session: aiohttp.ClientSession, key: str, expiry: str):
-    """Gọi API PHP tạo key."""
+async def call_create_key(session: aiohttp.ClientSession, key: str, expiry: str, app_id: str, allowed_devices: int):
+    """Gọi API PHP tạo key. Gửi thêm app_id và allowed_devices/unlimited_devices."""
     expiry = expiry.lower()
 
-    if expiry == "permanent":
-        params = {
-            "action": "create",
-            "plan": "permanent",
-            "custom_key": key
-        }
+    params = {
+        "action": "create",
+        "custom_key": key,
+        "app_id": app_id or "",
+    }
+
+    if allowed_devices == -1:
+        params["unlimited_devices"] = "1"
+        params["allowed_devices"] = "-1"
     else:
-        match = re.match(r"^\+?(\d+)d$", expiry)
-        duration_days = int(match.group(1)) if match else 1
-        params = {
-            "action": "create",
-            "plan": f"{duration_days}d",
-            "duration_days": duration_days,
-            "custom_key": key
-        }
+        params["allowed_devices"] = str(max(1, int(allowed_devices)))
+
+    if expiry == "permanent":
+        params["plan"] = "permanent"
+    else:
+        m = re.match(r"^\+?(\d+)d$", expiry)
+        if m:
+            days = int(m.group(1))
+            params["plan"] = f"{days}d"
+            params["duration_days"] = str(days)
+        else:
+            # default 1 day
+            params["plan"] = "1d"
+            params["duration_days"] = "1"
 
     try:
         async with session.get(CREATE_URL, params=params, timeout=20) as resp:
-            return resp.status, await resp.json(content_type=None)
+            # API cũ có thể trả JSON hoặc text, handle both
+            text = await resp.text()
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                # fallback: try parse simple key=value lines into dict
+                data = {}
+                for line in text.splitlines():
+                    if '=' in line:
+                        k,v = line.split('=',1)
+                        data[k.strip()] = v.strip()
+                # normalize
+                if not data:
+                    data = {"status":"error","message":text}
+            return resp.status, data
     except Exception as e:
         return -1, {"status": "error", "message": str(e)}
 
@@ -117,43 +149,142 @@ async def on_ready():
 # ----- CREATEKEY -----
 @bot.command(name="createkey")
 @has_role_allowed()
-async def createkey(ctx, quantity: int = 1, expiry: str = None, custom: str = None):
-    """Tạo key: !createkey <số lượng> [thời hạn] [custom_key]"""
+async def createkey(ctx, *args):
+    """
+    Usage examples:
+    /createkey 3 +7d app:aimbot devices:3
+    /createkey 1 permanent app:silent devices:unlimited VIPUSER
+    Or just /createkey (interactive mode)
+    """
     async with ctx.typing():
-        if quantity < 1 or quantity > MAX_KEYS_PER_COMMAND:
-            await ctx.reply(f"❌ Số lượng phải từ 1 tới {MAX_KEYS_PER_COMMAND}.")
-            return
+        # parse positional args first
+        # we support interactive mode if no args
+        if len(args) == 0:
+            # interactive flow
+            author = ctx.author
 
-        expiry_norm = expiry.lower() if expiry else "+1d"
+            def check(m):
+                return m.author == author and m.channel == ctx.channel
 
-        # Nếu có custom → chỉ tạo 1 key custom
-        if custom:
-            keys_to_create = [generate_saitama_key(custom)]
+            await ctx.send(f"{author.mention} Nhập số lượng (1-{MAX_KEYS_PER_COMMAND}):")
+            try:
+                msg = await bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+                quantity = int(msg.content.strip())
+                if quantity < 1 or quantity > MAX_KEYS_PER_COMMAND:
+                    await ctx.send(f"❌ Số lượng không hợp lệ, sử dụng 1.")
+                    quantity = 1
+            except Exception:
+                quantity = 1
+
+            await ctx.send("Nhập thời hạn (ví dụ: +1d, +7d, permanent). Mặc định +1d:")
+            try:
+                msg = await bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+                expiry = msg.content.strip() or "+1d"
+            except Exception:
+                expiry = "+1d"
+
+            await ctx.send("Chọn app (ví dụ: aimbot, silent, esp, premium). Gõ 'default' nếu bỏ qua:")
+            try:
+                msg = await bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+                app_id = msg.content.strip() or ""
+            except Exception:
+                app_id = ""
+
+            await ctx.send("Giới hạn thiết bị (số nguyên như 1,3) hoặc 'unlimited'. Mặc định 1:")
+            try:
+                msg = await bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+                dev_raw = msg.content.strip().lower() or "1"
+            except Exception:
+                dev_raw = "1"
+
+            if dev_raw == "unlimited":
+                allowed_devices = -1
+            else:
+                try:
+                    allowed_devices = max(1, int(dev_raw))
+                except:
+                    allowed_devices = 1
+
+            await ctx.send("Nếu cần custom key, gõ chuỗi custom (no spaces). Nếu không, gõ 'no':")
+            try:
+                msg = await bot.wait_for('message', check=check, timeout=INTERACTIVE_TIMEOUT)
+                custom = msg.content.strip()
+                if custom.lower() == 'no' or custom == '':
+                    custom = None
+            except Exception:
+                custom = None
+
         else:
-            keys_to_create = [generate_saitama_key() for _ in range(quantity)]
+            # parse inline args
+            # args example: 3 +7d app:aimbot devices:3 VIPUSER
+            quantity = 1
+            expiry = "+1d"
+            app_id = ""
+            allowed_devices = 1
+            custom = None
+
+            # first token that is integer -> quantity
+            for a in list(args):
+                if re.fullmatch(r"\d+", a):
+                    quantity = int(a)
+                    continue
+                if a.lower().startswith('+') or a.lower() == 'permanent' or re.fullmatch(r"\d+d", a.lower()):
+                    expiry = a
+                    continue
+                if a.lower().startswith("app:"):
+                    app_id = a.split(":",1)[1]
+                    continue
+                if a.lower().startswith("devices:"):
+                    dv = a.split(":",1)[1]
+                    if dv.lower() == "unlimited":
+                        allowed_devices = -1
+                    else:
+                        try:
+                            allowed_devices = int(dv)
+                        except:
+                            allowed_devices = 1
+                    continue
+                # last free token -> custom
+                custom = a
+
+            # normalize expiry
+            expiry = expiry or "+1d"
+
+            # ensure quantity bounds
+            quantity = max(1, min(MAX_KEYS_PER_COMMAND, int(quantity)))
+
+        # Build keys to create
+        keys_to_create = []
+        if custom:
+            # when custom provided, only create one with that custom
+            keys_to_create = [generate_saitama_key(custom)]
+            quantity = 1
+        else:
+            for _ in range(quantity):
+                keys_to_create.append(generate_saitama_key())
 
         results = []
         async with aiohttp.ClientSession() as session:
             for k in keys_to_create:
-                status, data = await call_create_key(session, k, expiry_norm)
+                status, data = await call_create_key(session, k, expiry, app_id, allowed_devices)
                 results.append((k, data))
 
-        success_keys = [d.get('license_key', k) for k, d in results if d.get("status") == "success"]
-        failed_keys = [k for k, d in results if d.get("status") != "success"]
+        success_keys = [ (d.get('license_key') or k) for k,d in results if d.get("status") in ("success","ok", True) or d.get("success") == True ]
+        failed = [ (k, d) for k,d in results if d.get("status") not in ("success","ok", True) and d.get("success") != True ]
 
         embed = discord.Embed(
             title="✨ TẠO KEY THÀNH CÔNG ✨" if success_keys else "⚠️ TẠO KEY THẤT BẠI ⚠️",
-            description=f"👤 **Người yêu cầu:** {ctx.author.mention}\n🕓 **Thời hạn:** `{expiry_norm}`\n🔢 **Số lượng:** `{len(keys_to_create)}`",
+            description=f"👤 **Người yêu cầu:** {ctx.author.mention}\n🕓 **Thời hạn:** `{expiry}`\n🔢 **Số lượng yêu cầu:** `{len(keys_to_create)}`\n🔧 **App:** `{app_id or 'none'}`\n📱 **Giới hạn thiết bị:** `{('Không giới hạn' if allowed_devices==-1 else allowed_devices)}`",
             color=0x2ecc71 if success_keys else 0xe74c3c,
             timestamp=datetime.utcnow()
         )
 
         if success_keys:
             embed.add_field(name="✅ Key(s) thành công", value="\n".join(f"`{k}`" for k in success_keys), inline=False)
-        if failed_keys:
-            embed.add_field(name="❌ Key(s) thất bại", value="\n".join(f"`{k}`" for k in failed_keys), inline=False)
+        if failed:
+            embed.add_field(name="❌ Key(s) thất bại", value="\n".join(f"`{k}` ({(d.get('message') or d)})" for k,d in failed), inline=False)
 
-        embed.set_thumbnail(url=ICON_VIP if expiry_norm == "permanent" else ICON_KEY)
+        embed.set_thumbnail(url=ICON_VIP if expiry == "permanent" else ICON_KEY)
         embed.set_footer(text="Hệ thống KeyAuth • SAITAMA VN", icon_url=ICON_LOGO)
         await ctx.send(embed=embed)
 
@@ -207,19 +338,19 @@ async def helpkeys(ctx):
     )
 
     embed.add_field(
-        name="🔑 !createkey `<số lượng>` `[thời hạn]` `[tùy chọn]`",
+        name="🔑 /createkey `<số lượng>` `[thời hạn]` `[tùy chọn]`",
         value=(
-            "▫️ `!createkey 3 +7d` → tạo 3 key random, hạn 7 ngày\n"
-            "▫️ `!createkey 1 +7d VIPUSER` → tạo 1 key tên `SAITAMA-VIPUSER`, hạn 7 ngày\n"
-            "▫️ `!createkey 1 permanent` → tạo 1 key vĩnh viễn\n"
-            "▫️ `!createkey 1 permanent VIPUSER` → tạo key `SAITAMA-VIPUSER` vĩnh viễn"
+            "▫️ `/createkey 3 +7d app:aimbot devices:3` → tạo 3 key random, hạn 7 ngày, app aimbot, tối đa 3 thiết bị\n"
+            "▫️ `/createkey 1 +7d app:aimbot devices:3 VIPUSER` → tạo 1 key custom `VIPUSER`\n"
+            "▫️ `/createkey` → chạy interactive flow để nhập từng thông tin\n"
+            "▫️ `/createkey 1 permanent app:silent devices:unlimited` → tạo key vĩnh viễn cho silent không giới hạn thiết bị\n"
         ),
         inline=False
     )
 
     embed.add_field(
-        name="♻️ !resetkey `<key1>` `[key2] ...`",
-        value="Reset một hoặc nhiều key cùng lúc.\nVí dụ: `!resetkey SAITAMA-ABC SAITAMA-XYZ`",
+        name="♻️ /resetkey `<key1>` `[key2] ...`",
+        value="Reset một hoặc nhiều key cùng lúc.\nVí dụ: `/resetkey SAITAMA-ABC SAITAMA-XYZ`",
         inline=False
     )
 
