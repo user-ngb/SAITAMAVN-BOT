@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import aiohttp
 import discord
 from discord.ext import commands
