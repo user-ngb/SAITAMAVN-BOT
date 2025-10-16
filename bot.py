@@ -33,7 +33,7 @@ ICON_VIP = "https://i.imgur.com/bIvsLKH.gif"
 ICON_LOGO = "https://i.imgur.com/ZOajx1X.gif"
 
 # =====================
-# 🌐 KEEP ALIVE SERVER (Replit 24/7)
+# 🌐 KEEP ALIVE SERVER (Replit/Render)
 # =====================
 app = Flask('')
 
@@ -65,20 +65,15 @@ def has_role_allowed():
 
 
 def generate_saitama_key(custom: str = None):
-    """
-    Sinh key ngẫu nhiên dạng HEX-like (13 ký tự).
-    Nếu custom được cung cấp, tạo 1 phần hex + clean custom làm suffix.
-    """
     hex_part = secrets.token_hex(7).upper()[:13]
     if custom:
-        # sanitize custom: chữ/ số / - / _
         safe = re.sub(r'[^A-Za-z0-9\-_]', '', custom)[:12].upper()
         return f"{hex_part}/{safe}"
     return hex_part
 
 
+# ✅ ĐÃ SỬA Ở ĐÂY — đổi từ GET → POST để Render không lỗi 415
 async def call_create_key(session: aiohttp.ClientSession, key: str, expiry: str, app_id: str, allowed_devices: int):
-    """Gọi API PHP tạo key. Gửi thêm app_id và allowed_devices/unlimited_devices."""
     expiry = expiry.lower()
 
     params = {
@@ -102,33 +97,29 @@ async def call_create_key(session: aiohttp.ClientSession, key: str, expiry: str,
             params["plan"] = f"{days}d"
             params["duration_days"] = str(days)
         else:
-            # default 1 day
             params["plan"] = "1d"
             params["duration_days"] = "1"
 
     try:
-        async with session.get(CREATE_URL, params=params, timeout=20) as resp:
-            # API cũ có thể trả JSON hoặc text, handle both
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        async with session.post(CREATE_URL, data=params, headers=headers, timeout=20) as resp:
             text = await resp.text()
             try:
                 data = await resp.json(content_type=None)
             except Exception:
-                # fallback: try parse simple key=value lines into dict
                 data = {}
                 for line in text.splitlines():
                     if '=' in line:
-                        k,v = line.split('=',1)
+                        k, v = line.split('=', 1)
                         data[k.strip()] = v.strip()
-                # normalize
                 if not data:
-                    data = {"status":"error","message":text}
+                    data = {"status": "error", "message": text}
             return resp.status, data
     except Exception as e:
         return -1, {"status": "error", "message": str(e)}
 
 
 async def call_reset_key(session: aiohttp.ClientSession, key: str):
-    """Gọi API reset key."""
     url = RESET_URL_TEMPLATE.format(key=aiohttp.helpers.quote(key, safe=''))
     try:
         async with session.get(url, timeout=20) as resp:
@@ -144,7 +135,6 @@ async def call_reset_key(session: aiohttp.ClientSession, key: str):
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     await bot.change_presence(activity=discord.Game(name=f"{BOT_PREFIX}helpkeys để xem hướng dẫn"))
-
 
 # ----- CREATEKEY -----
 @bot.command(name="createkey")
@@ -357,10 +347,10 @@ async def helpkeys(ctx):
     embed.set_footer(text="Hệ thống KeyAuth • SAITAMA VN", icon_url=ICON_LOGO)
     await ctx.send(embed=embed)
 
-
 # =====================
 # 🏁 RUN BOT
 # =====================
 if __name__ == "__main__":
-    keep_alive()  # ✅ Giữ bot online 24/7 trên Replit
+    keep_alive()
     bot.run(BOT_TOKEN)
+    
